@@ -1,0 +1,97 @@
+version: "3"
+
+tasks:
+  default:
+    desc: Show available tasks
+    cmds:
+      - task --list
+
+  build:
+    desc: Build the Rust binary
+    cmds:
+      - cargo build
+
+  run:
+    desc: Run red-table (pass arguments after --)
+    cmds:
+      - cargo run -- {{.CLI_ARGS}}
+
+  test:
+    desc: Run the Rust and Yazi plugin test suites
+    cmds:
+      - cargo nextest run
+      - lua tests/yazi_plugin.lua
+      - bash tests/yazi_plugin_smoke.sh
+
+  benchmark-thumbnail-resize:
+    cmds:
+      - cargo bench --bench thumbnail_resize
+
+  benchmark-thumbnail-cache:
+    cmds:
+      - cargo bench --bench persistent_cache
+
+  benchmark-kitty-protocol:
+    cmds:
+      - cargo bench --bench kitty_protocol
+
+  benchmark-inspection-view:
+    cmds:
+      - cargo bench --bench inspection_view
+
+  benchmark-selection-pipeline:
+    cmds:
+      - cargo bench --bench selection_pipeline
+
+  benchmark-comparison-view:
+    cmds:
+      - cargo bench --bench comparison_view
+
+  format:
+    desc: Format Rust, Nix, and Lua sources
+    cmds:
+      - cargo fmt --all
+      - alejandra .
+      - stylua red-table.yazi tests/yazi_plugin.lua tests/yazi-smoke/init.lua
+
+  format-check:
+    desc: Verify Rust, Nix, Lua, and shell formatting and syntax
+    cmds:
+      - cargo fmt --all --check
+      - alejandra --check .
+      - stylua --check red-table.yazi tests/yazi_plugin.lua tests/yazi-smoke/init.lua
+      - bash -n tests/yazi_plugin_smoke.sh tests/yazi-smoke/red-table-wrapper.sh
+
+  lint:
+    desc: Reject Rust compiler and Clippy warnings
+    cmds:
+      - cargo clippy --all-targets --all-features -- -D warnings
+
+  docs-build:
+    desc: Build the user documentation site
+    cmds:
+      - mkdocs build --strict
+
+  docs-serve:
+    desc: Serve the user documentation site locally
+    cmds:
+      - mkdocs serve
+
+  validate:
+    desc: Validate the public source package
+    cmds:
+      - test -f Cargo.toml
+      - test -f Cargo.lock
+      - test -f LICENSE
+      - test -f README.md
+      - test -f README.de.md
+      - test -f source/main.rs
+      - test -f source/lib.rs
+      - test -f red-table.yazi/main.lua
+      - test -f documentation/user-manual/en/getting-started.md
+      - test -f documentation/user-manual/de/erste-schritte.md
+      - cargo metadata --no-deps --format-version 1 >/dev/null
+
+  check:
+    desc: Run formatting, linting, tests, docs, and package validation
+    deps: [format-check, lint, test, docs-build, validate]

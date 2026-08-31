@@ -1,0 +1,31 @@
+site_name: red-table
+site_description: User documentation for the red-table terminal image browser
+docs_dir: documentation
+site_dir: site
+
+theme:
+  name: material
+  language: en
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+plugins:
+  - search
+
+nav:
+  - Home: index.md
+  - User manual:
+      - English: user-manual/en/getting-started.md
+      - Deutsch: user-manual/de/erste-schritte.md
+  - References:
+      - Configuration: references/configuration.md
+      - Thumbnail cache: references/thumbnail-cache.md

@@ -1,0 +1,7 @@
+/.direnv/
+/.task/
+/.cache/
+/result
+/result-*
+/site/
+/target/

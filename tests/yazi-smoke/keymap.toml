@@ -1,0 +1,4 @@
+[[mgr.prepend_keymap]]
+on   = "R"
+run  = "plugin red-table"
+desc = "Run red-table smoke test"
