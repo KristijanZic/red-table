@@ -8,6 +8,16 @@ and `l` navigation.
 The application is implemented in Rust and distributed with reproducible Nix
 build metadata.
 
+## Showcase
+
+[Watch the 19-second terminal demo on YouTube](https://youtu.be/rcg16ZPUYgA).
+
+The real Kitty session starts at a neutral terminal prompt, launches `red-table`,
+opens the sharp eight-image grid, marks and inspects an image fullscreen, returns
+to the exact grid position, and finishes in the two-pane A/B comparison. The
+eight neutral sample images shown in the recording are included in
+[`media/showcase`](media/showcase/) so the workflow can be tried locally.
+
 ## Development environment
 
 Nix and direnv are the only bootstrap requirements. All project tools,

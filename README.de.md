@@ -8,6 +8,17 @@ Vim-Tasten `h`, `j`, `k` und `l`.
 Die Anwendung ist in Rust implementiert und wird mit reproduzierbaren
 Nix-Build-Metadaten ausgeliefert.
 
+## Kurz-Demo
+
+[Die 19-sekündige Terminal-Demo auf YouTube ansehen](https://youtu.be/rcg16ZPUYgA).
+
+Die echte Kitty-Sitzung beginnt an einer neutralen Eingabeaufforderung, startet
+`red-table`, öffnet das scharfe Raster mit acht Bildern, markiert ein Bild und
+prüft es in der Großansicht. Danach kehrt sie exakt zur vorherigen Rasterposition
+zurück und endet im zweigeteilten A/B-Vergleich. Die acht neutral benannten
+Beispielbilder aus der Aufnahme liegen unter [`media/showcase`](media/showcase/)
+und können direkt lokal ausprobiert werden.
+
 ## Entwicklungsumgebung
 
 Nix und direnv sind die einzigen Bootstrap-Voraussetzungen. Rust, Cargo, Task,

@@ -11,6 +11,7 @@
       "x86_64-linux"
       "aarch64-linux"
     ];
+    projectVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
     forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
     pkgsFor = system: import nixpkgs {inherit system;};
   in {
@@ -20,7 +21,7 @@
       in {
         default = pkgs.rustPlatform.buildRustPackage {
           pname = "red-table";
-          version = "0.1.0";
+          version = projectVersion;
           src = pkgs.lib.cleanSource ./.;
           cargoLock.lockFile = ./Cargo.lock;
 
@@ -33,7 +34,7 @@
 
         yazi-plugin = pkgs.stdenvNoCC.mkDerivation {
           pname = "red-table-yazi";
-          version = "0.1.0";
+          version = projectVersion;
           src = ./red-table.yazi;
           dontBuild = true;
 
@@ -88,20 +89,27 @@
             direnv
             docs
             expect
+            ffmpeg-full
             figlet
             findutils
             git
+            gawk
             gnutar
             gnugrep
+            gnused
             go-task
             nix
             nix-direnv
             pkg-config
             lua5_4
+            imagemagick
+            kitty
             rust-analyzer
             rustc
             rustfmt
             stylua
+            xdotool
+            xorg-server
             yazi
           ];
 
