@@ -50,8 +50,9 @@ end
 
 function M.run(command, cwd)
   return Command(command)
-    :arg({ "--select", "--print0", "--", cwd })
-    :stdin(Command.NULL)
+    :arg("--select")
+    :arg("--print0")
+    :arg(cwd)
     :stdout(Command.PIPED)
     :stderr(Command.PIPED)
     :output()
