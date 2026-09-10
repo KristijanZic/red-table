@@ -10,6 +10,7 @@
     supportedSystems = [
       "x86_64-linux"
       "aarch64-linux"
+      "aarch64-darwin"
     ];
     projectVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
     forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
