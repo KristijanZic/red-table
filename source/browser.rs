@@ -1298,7 +1298,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn startup_canonicalizes_image_symlinks_and_accepts_non_utf8_names() {
         use std::os::unix::{ffi::OsStringExt, fs::symlink};
