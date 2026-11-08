@@ -25,6 +25,7 @@
           version = projectVersion;
           src = pkgs.lib.cleanSource ./.;
           cargoLock.lockFile = ./Cargo.lock;
+          nativeCheckInputs = with pkgs; [bashInteractive coreutils expect fish zsh];
 
           meta = {
             description = "Fast, keyboard-driven terminal image browser";
@@ -91,6 +92,7 @@
             docs
             expect
             ffmpeg-full
+            fish
             figlet
             findutils
             git
@@ -112,11 +114,16 @@
             xdotool
             xorg-server
             yazi
+            zsh
           ];
 
           RUST_BACKTRACE = "1";
 
           shellHook = ''
+            # The invoking shell may carry a dynamic-linker search path from
+            # another environment. It would shadow this closure's libraries,
+            # so the shell owns the search path and drops the inherited value.
+            unset LD_LIBRARY_PATH
             ${pkgs.figlet}/bin/figlet -w 120 "red-table"
             printf '\n'
             printf '  Rust image browser | performance first | keyboard driven\n'

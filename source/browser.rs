@@ -1,4 +1,5 @@
 use std::{
+    io,
     path::PathBuf,
     sync::mpsc,
     time::{Duration, Instant},
@@ -10,11 +11,12 @@ use ratatui_image::picker::Picker;
 use crate::{
     BoxError,
     actions::{Action, ActionContext, Bindings},
-    app::{App, EntryId, InputMode},
+    app::{App, EntryId, InputMode, SourceRevision, is_supported_image},
     config::RuntimeSettings,
     graphics,
     inspection::{DecodedSources, Inspection, InspectionDisplay, InspectionKey, ViewState},
     kitty::KittySession,
+    refresh::{RevisionCheck, RevisionMonitor},
     scan::{self, ScanEvent},
     settings::{BackgroundMode, DEFAULT_THUMBNAIL_SIZE, ThumbnailQuality, ThumbnailSize},
     terminal::{AppTerminal, TerminalSession, TerminalTarget},
@@ -23,6 +25,15 @@ use crate::{
 };
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+/// Delays after a frame that transmitted Kitty image data at which a
+/// state-neutral repaint nudge is written. The terminal resolves new virtual
+/// placements only on a repaint that follows the transmitting input burst;
+/// the second nudge covers slow renderers.
+const REPAINT_NUDGE_DELAYS: [Duration; 2] = [Duration::from_millis(50), Duration::from_millis(300)];
+/// Poll interval while no scan, thumbnail, inspection, or cleanup work is
+/// pending; this also wakes the loop to schedule source revision checks.
+const IDLE_INTERVAL: Duration = Duration::from_millis(250);
+const REVISION_INTERVAL: Duration = Duration::from_secs(1);
 const PREFETCH_ROWS: usize = 1;
 
 pub(crate) enum BrowseOutcome {
@@ -37,32 +48,98 @@ pub(crate) fn run(
     selection_mode: bool,
     input_paths: Option<Vec<PathBuf>>,
 ) -> Result<BrowseOutcome, BoxError> {
-    let root = path
-        .canonicalize()
-        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
-    if !root.is_dir() {
-        return Err(format!("not a directory: {}", root.display()).into());
-    }
+    let target = StartupTarget::resolve(&path)?;
 
     let mut terminal = TerminalSession::new(TerminalTarget::for_result_mode(selection_mode))?;
     let (picker, protocol_name) =
         graphics::select_picker(settings.graphics_protocol, !selection_mode);
-    let result = Browser::new(
-        root,
+    let kitty_session = KittySession::from_process();
+    let mut browser = Browser::new(
+        target.root,
         picker,
         protocol_name,
         settings,
         selection_mode,
         input_paths,
-    )
-    .run(terminal.terminal_mut());
+        kitty_session.clone(),
+    );
+    if let Some((path, revision)) = target.image {
+        browser.open_startup_image(path, revision);
+    }
+    let loop_result = browser.run(terminal.terminal_mut());
+    let close_result = close(
+        browser,
+        &kitty_session,
+        terminal.terminal_mut().backend_mut(),
+    );
     terminal.restore();
-    result
+    loop_result?;
+    Ok(close_result?)
+}
+
+struct StartupTarget {
+    root: PathBuf,
+    image: Option<(PathBuf, SourceRevision)>,
+}
+
+impl StartupTarget {
+    fn resolve(path: &std::path::Path) -> Result<Self, BoxError> {
+        use crate::diagnostics::Diagnostic;
+
+        let resolved = path.canonicalize().map_err(|error| {
+            Diagnostic::new(
+                format!("cannot open {}: {error}", path.display()),
+                "Check that the path exists and that you have permission to read it.",
+            )
+        })?;
+        if resolved.is_dir() {
+            return Ok(Self {
+                root: resolved,
+                image: None,
+            });
+        }
+        if !resolved.is_file() || !is_supported_image(&resolved) {
+            return Err(Diagnostic::new(
+                format!("not a supported image or directory: {}", resolved.display()),
+                "Pass a directory or a JPEG, PNG, GIF, WebP, TIFF, or BMP image.",
+            )
+            .into());
+        }
+        let revision = scan::revision_for(&resolved).map_err(|()| {
+            Diagnostic::new(
+                format!("cannot read image metadata: {}", resolved.display()),
+                "Check that the image still exists and is readable.",
+            )
+        })?;
+        Ok(Self {
+            root: resolved
+                .parent()
+                .expect("regular file has a parent")
+                .to_path_buf(),
+            image: Some((resolved, revision)),
+        })
+    }
+}
+
+/// Finishes the browser and releases every terminal-side image it still owns.
+///
+/// Dropping the browser queues deletions for all transmitted Kitty images, so
+/// the drain must run afterwards and before the terminal is restored.
+fn close(
+    browser: Browser,
+    kitty_session: &KittySession,
+    writer: &mut dyn io::Write,
+) -> io::Result<BrowseOutcome> {
+    let outcome = browser.finish();
+    kitty_session.drain_cleanup(writer)?;
+    Ok(outcome)
 }
 
 struct Browser {
     app: App,
     scanner: mpsc::Receiver<ScanEvent>,
+    revisions: RevisionMonitor,
+    next_revision_check: Instant,
     thumbnails: Thumbnails,
     kitty_session: KittySession,
     inspection: Inspection,
@@ -87,6 +164,7 @@ struct Browser {
     running: bool,
     selection_mode: bool,
     confirmed: bool,
+    repaint_nudges: Vec<Instant>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -146,6 +224,18 @@ impl CompareState {
 }
 
 impl Browser {
+    fn open_startup_image(&mut self, path: PathBuf, revision: SourceRevision) {
+        let id = self.app.add_path(path, revision);
+        self.app.integrate_pending();
+        self.app.selected = self
+            .app
+            .filtered
+            .iter()
+            .position(|entry| *entry == id)
+            .unwrap_or(0);
+        self.handle_normal_action(Some(Action::OpenInspect));
+    }
+
     fn new(
         root: PathBuf,
         picker: Picker,
@@ -153,9 +243,9 @@ impl Browser {
         settings: RuntimeSettings,
         selection_mode: bool,
         input_paths: Option<Vec<PathBuf>>,
+        kitty_session: KittySession,
     ) -> Self {
         let decoded_sources = DecodedSources::new(settings.decoded_cache_bytes);
-        let kitty_session = KittySession::from_process();
         let inspection = Inspection::with_session(
             picker.clone(),
             decoded_sources.clone(),
@@ -169,6 +259,8 @@ impl Browser {
                 None => scan::start(root.clone()),
             },
             app: App::new(root),
+            revisions: RevisionMonitor::new(),
+            next_revision_check: Instant::now(),
             thumbnails: Thumbnails::with_session(picker, kitty_session.clone()),
             kitty_session,
             inspection,
@@ -200,91 +292,143 @@ impl Browser {
             running: true,
             selection_mode,
             confirmed: false,
+            repaint_nudges: Vec::new(),
         }
     }
 
-    fn run(mut self, terminal: &mut AppTerminal) -> Result<BrowseOutcome, BoxError> {
+    fn run(&mut self, terminal: &mut AppTerminal) -> Result<(), BoxError> {
         let mut dirty = true;
         while self.running {
             let frame_started = Instant::now();
             dirty |= self.drain_background_work();
+            self.schedule_revision_check(frame_started);
             dirty |= self.kitty_session.drain_cleanup(terminal.backend_mut())? > 0;
+            self.write_due_repaint_nudges(terminal.backend_mut(), frame_started)?;
             if dirty {
-                self.prepare_render_visibility();
-                terminal.draw(|frame| match self.view {
-                    BrowserView::Grid => {
-                        self.grid = ui::render_grid(
-                            frame,
-                            &mut self.app,
-                            &mut self.thumbnails,
-                            RenderOptions {
-                                protocol_name: &self.protocol_name,
-                                thumbnail_size: self.thumbnail_size,
-                                thumbnail_quality: self.thumbnail_quality,
-                                bindings: &self.bindings,
-                                show_help: self.show_help,
-                                debug_status: self.debug_status,
-                                selection_mode: self.selection_mode,
-                            },
-                        );
-                    }
-                    BrowserView::Inspect(state) => {
-                        let display = self
-                            .inspection_key
-                            .map(|key| self.inspection.display(key))
-                            .unwrap_or(InspectionDisplay::Loading);
-                        self.inspection_size = ui::render_inspection(
-                            frame,
-                            &self.app,
-                            InspectionOptions {
-                                display,
-                                state,
-                                background: self.background,
-                                bindings: &self.bindings,
-                                show_help: self.show_help,
-                                debug_status: self.debug_status,
-                                protocol_name: &self.protocol_name,
-                                selection_mode: self.selection_mode,
-                            },
-                        );
-                    }
-                    BrowserView::Compare(state) => {
-                        let reference_display = self
-                            .inspection_key
-                            .map(|key| self.inspection.display(key))
-                            .unwrap_or(InspectionDisplay::Loading);
-                        let candidate_display = self
-                            .comparison_key
-                            .map(|key| self.comparison_inspection.display(key))
-                            .unwrap_or(InspectionDisplay::Loading);
-                        let sizes = ui::render_comparison(
-                            frame,
-                            &self.app,
-                            ComparisonOptions {
-                                state,
-                                reference_display,
-                                candidate_display,
-                                background: self.background,
-                                bindings: &self.bindings,
-                                show_help: self.show_help,
-                                debug_status: self.debug_status,
-                                protocol_name: &self.protocol_name,
-                                selection_mode: self.selection_mode,
-                            },
-                        );
-                        self.inspection_size = sizes[0];
-                        self.comparison_size = sizes[1];
-                    }
-                })?;
+                self.render_frame(terminal)?;
                 dirty = self.schedule_work();
             }
 
-            let wait = FRAME_INTERVAL.saturating_sub(frame_started.elapsed());
+            let now = Instant::now();
+            let wait = self
+                .poll_wait(now)
+                .saturating_sub(now.duration_since(frame_started));
             if event::poll(wait)? {
                 dirty |= self.handle_event(event::read()?);
             }
         }
-        Ok(self.finish())
+        Ok(())
+    }
+
+    /// Time to wait for input: the frame or idle interval, shortened so a due
+    /// repaint nudge is not delayed past its schedule.
+    fn poll_wait(&self, now: Instant) -> Duration {
+        let interval = poll_interval(self.has_background_work());
+        self.repaint_nudges
+            .iter()
+            .map(|due| due.saturating_duration_since(now))
+            .min()
+            .map_or(interval, |until_nudge| interval.min(until_nudge))
+    }
+
+    /// Writes one repaint nudge when at least one scheduled nudge is due and
+    /// drops every due entry. Returns how many entries were due.
+    fn write_due_repaint_nudges(
+        &mut self,
+        writer: &mut dyn io::Write,
+        now: Instant,
+    ) -> io::Result<usize> {
+        let due = self.repaint_nudges.iter().filter(|at| **at <= now).count();
+        if due == 0 {
+            return Ok(0);
+        }
+        self.repaint_nudges.retain(|at| *at > now);
+        KittySession::write_repaint_nudge(writer)?;
+        Ok(due)
+    }
+
+    /// Draws one frame and, when it transmitted Kitty image data, schedules
+    /// the repaint nudges so the new placements are painted without input.
+    fn render_frame(&mut self, terminal: &mut AppTerminal) -> Result<(), BoxError> {
+        self.render_frame_at(terminal, Instant::now())
+    }
+
+    fn render_frame_at(
+        &mut self,
+        terminal: &mut AppTerminal,
+        now: Instant,
+    ) -> Result<(), BoxError> {
+        self.prepare_render_visibility();
+        terminal.draw(|frame| match self.view {
+            BrowserView::Grid => {
+                self.grid = ui::render_grid(
+                    frame,
+                    &mut self.app,
+                    &mut self.thumbnails,
+                    RenderOptions {
+                        protocol_name: &self.protocol_name,
+                        thumbnail_size: self.thumbnail_size,
+                        thumbnail_quality: self.thumbnail_quality,
+                        bindings: &self.bindings,
+                        show_help: self.show_help,
+                        debug_status: self.debug_status,
+                        selection_mode: self.selection_mode,
+                    },
+                );
+            }
+            BrowserView::Inspect(state) => {
+                let display = self
+                    .inspection_key
+                    .map(|key| self.inspection.display(key))
+                    .unwrap_or(InspectionDisplay::Loading);
+                self.inspection_size = ui::render_inspection(
+                    frame,
+                    &self.app,
+                    InspectionOptions {
+                        display,
+                        state,
+                        background: self.background,
+                        bindings: &self.bindings,
+                        show_help: self.show_help,
+                        debug_status: self.debug_status,
+                        protocol_name: &self.protocol_name,
+                        selection_mode: self.selection_mode,
+                    },
+                );
+            }
+            BrowserView::Compare(state) => {
+                let reference_display = self
+                    .inspection_key
+                    .map(|key| self.inspection.display(key))
+                    .unwrap_or(InspectionDisplay::Loading);
+                let candidate_display = self
+                    .comparison_key
+                    .map(|key| self.comparison_inspection.display(key))
+                    .unwrap_or(InspectionDisplay::Loading);
+                let sizes = ui::render_comparison(
+                    frame,
+                    &self.app,
+                    ComparisonOptions {
+                        state,
+                        reference_display,
+                        candidate_display,
+                        background: self.background,
+                        bindings: &self.bindings,
+                        show_help: self.show_help,
+                        debug_status: self.debug_status,
+                        protocol_name: &self.protocol_name,
+                        selection_mode: self.selection_mode,
+                    },
+                );
+                self.inspection_size = sizes[0];
+                self.comparison_size = sizes[1];
+            }
+        })?;
+        if self.kitty_session.take_transmissions() > 0 {
+            self.repaint_nudges
+                .extend(REPAINT_NUDGE_DELAYS.iter().map(|delay| now + *delay));
+        }
+        Ok(())
     }
 
     fn finish(self) -> BrowseOutcome {
@@ -295,6 +439,14 @@ impl Browser {
         } else {
             BrowseOutcome::Completed
         }
+    }
+
+    fn has_background_work(&self) -> bool {
+        !self.app.scan_done
+            || self.thumbnails.pending_count() > 0
+            || self.inspection.is_pending()
+            || self.comparison_inspection.is_pending()
+            || self.kitty_session.has_pending_cleanup()
     }
 
     fn drain_background_work(&mut self) -> bool {
@@ -323,12 +475,52 @@ impl Browser {
                     }
                 }
             }
+            changed |= self.app.integrate_pending();
+        }
+        for change in self.revisions.drain() {
+            changed |= self
+                .app
+                .update_revision(change.id, change.previous, change.current);
         }
         let (completed, errors) = self.thumbnails.drain();
         self.app.thumbnail_errors += errors;
         let inspection_changed = self.inspection.drain();
         let comparison_changed = self.comparison_inspection.drain();
         changed || completed > 0 || inspection_changed || comparison_changed
+    }
+
+    fn revision_checks(&self) -> Vec<RevisionCheck> {
+        let ids = match self.view {
+            BrowserView::Grid => self
+                .app
+                .viewport_entry_ids(self.grid.columns, self.grid.rows, PREFETCH_ROWS)
+                .collect::<Vec<_>>(),
+            BrowserView::Inspect(_) => self
+                .app
+                .selected_entry()
+                .map(|entry| entry.id)
+                .into_iter()
+                .collect(),
+            BrowserView::Compare(state) => std::iter::once(state.reference_id)
+                .chain(self.app.selected_entry().map(|entry| entry.id))
+                .collect(),
+        };
+        ids.into_iter()
+            .filter_map(|id| self.app.entry(id))
+            .map(|entry| RevisionCheck {
+                id: entry.id,
+                path: entry.path.clone(),
+                previous: entry.revision,
+            })
+            .collect()
+    }
+
+    fn schedule_revision_check(&mut self, now: Instant) {
+        if now < self.next_revision_check || self.revisions.is_pending() {
+            return;
+        }
+        self.revisions.request(self.revision_checks());
+        self.next_revision_check = now + REVISION_INTERVAL;
     }
 
     fn schedule_work(&mut self) -> bool {
@@ -415,7 +607,9 @@ impl Browser {
             self.view = BrowserView::Grid;
             return false;
         };
-        if candidate.id == state.reference_id || !self.app.filtered.contains(&state.reference_id) {
+        if candidate.id == state.reference_id
+            || self.app.filtered_position(state.reference_id).is_none()
+        {
             self.view = BrowserView::Grid;
             return false;
         }
@@ -503,6 +697,7 @@ impl Browser {
         match action {
             Some(Action::Quit) => self.running = false,
             Some(Action::StartSearch) => self.app.start_search(),
+            Some(Action::ToggleSort) => self.app.toggle_sort(),
             Some(Action::ThumbnailLarger) => {
                 self.thumbnail_size = self.thumbnail_size.larger_for_grid(
                     self.grid.area.width,
@@ -765,7 +960,7 @@ impl Browser {
             return;
         };
         let candidate = self.app.filtered.get(self.app.selected).copied();
-        if !self.app.filtered.contains(&state.reference_id)
+        if self.app.filtered_position(state.reference_id).is_none()
             || candidate.is_none_or(|id| id == state.reference_id)
         {
             self.view = BrowserView::Grid;
@@ -788,6 +983,14 @@ impl Browser {
             }
             _ => {}
         }
+    }
+}
+
+const fn poll_interval(has_background_work: bool) -> Duration {
+    if has_background_work {
+        FRAME_INTERVAL
+    } else {
+        IDLE_INTERVAL
     }
 }
 
@@ -841,15 +1044,304 @@ mod tests {
             settings,
             false,
             None,
+            KittySession::with_tmux(false),
         );
-        for name in ["one.png", "two.png", "three.png"] {
+        for name in ["1-one.png", "2-two.png", "3-three.png"] {
             browser
                 .app
                 .add_path(root.join(name), SourceRevision::default());
         }
+        browser.app.integrate_pending();
         browser.grid.columns = 2;
         browser.grid.rows = 1;
         (browser, root)
+    }
+
+    #[test]
+    fn revision_monitoring_is_limited_to_the_active_working_set() {
+        let (mut browser, root) = browser_with_images();
+        for index in 3..10_000 {
+            browser
+                .app
+                .add_path(root.join(format!("{index}.png")), SourceRevision::default());
+        }
+        browser.app.integrate_pending();
+        browser.app.selected = 5000;
+        browser.app.ensure_visible(2, 1);
+        let checks = browser.revision_checks();
+        assert!(checks.len() <= 2 * (1 + 2 * PREFETCH_ROWS));
+        assert!(checks.iter().any(|check| check.id == EntryId(5000)));
+        browser.handle_normal_action(Some(Action::OpenInspect));
+        let checks = browser.revision_checks();
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].id, EntryId(5000));
+        browser.handle_inspect_action(Some(Action::CloseInspect));
+        browser.start_comparison();
+        let checks = browser.revision_checks();
+        assert_eq!(checks.len(), 2);
+        assert_eq!(checks[0].id, EntryId(5000));
+        assert_eq!(checks[1].id, EntryId(5001));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn wait_for_browser(browser: &mut Browser, mut complete: impl FnMut(&mut Browser) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            browser.drain_background_work();
+            browser.schedule_work();
+            if complete(browser) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "background refresh timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn prepared_color(prepared: &crate::thumbnails::PreparedThumbnail) -> ratatui::style::Color {
+        use crate::thumbnails::PreparedThumbnail;
+        use ratatui::{Terminal, backend::TestBackend};
+        let PreparedThumbnail::Standard(protocol) = prepared else {
+            panic!("expected halfblocks");
+        };
+        let mut terminal = Terminal::new(TestBackend::new(8, 4)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(ratatui_image::Image::new(protocol), frame.area());
+            })
+            .unwrap();
+        terminal.backend().buffer()[(4, 2)].fg
+    }
+
+    fn inspection_color(
+        inspection: &Inspection,
+        key: Option<InspectionKey>,
+    ) -> Option<ratatui::style::Color> {
+        match inspection.display(key?) {
+            InspectionDisplay::Ready(prepared) => Some(prepared_color(prepared)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn external_edits_reload_grid_inspection_and_both_comparison_panes() {
+        use crate::thumbnails::ThumbnailDisplay;
+        use image::{Rgb, RgbImage};
+        use ratatui::{layout::Size, style::Color};
+
+        let (mut browser, root) = browser_with_images();
+        // Isolate this test's known entries from the concurrent startup scanner.
+        browser.app.scan_done = true;
+        let paths = [root.join("1-one.png"), root.join("2-two.png")];
+        let save = |path: &std::path::Path, color, seconds| {
+            RgbImage::from_pixel(16, 16, Rgb(color)).save(path).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds))
+                .unwrap();
+        };
+        save(&paths[0], [255, 0, 0], 42);
+        save(&paths[1], [255, 0, 0], 42);
+        for path in &paths {
+            browser
+                .app
+                .add_path(path.clone(), scan::revision_for(path).unwrap());
+        }
+        browser.app.filtered.truncate(2);
+        browser.grid.image_size = Size::new(8, 4);
+        browser.inspection_size = Size::new(8, 4);
+        browser.comparison_size = Size::new(8, 4);
+        browser.app.toggle_mark();
+        let grid_color = |browser: &mut Browser| {
+            let entry = browser.app.selected_entry().unwrap();
+            let key = ThumbnailKey {
+                entry_id: entry.id,
+                revision: entry.revision,
+                size: browser.grid.image_size,
+                quality: browser.thumbnail_quality,
+            };
+            match browser.thumbnails.display(key) {
+                ThumbnailDisplay::Ready(prepared) => Some(prepared_color(prepared)),
+                _ => None,
+            }
+        };
+        wait_for_browser(&mut browser, |browser| {
+            grid_color(browser) == Some(Color::Rgb(255, 0, 0))
+        });
+        browser.handle_normal_action(Some(Action::OpenInspect));
+        wait_for_browser(&mut browser, |browser| {
+            inspection_color(&browser.inspection, browser.inspection_key)
+                == Some(Color::Rgb(255, 0, 0))
+        });
+        browser.handle_inspect_action(Some(Action::ZoomIn));
+        let view_before = format!("{:?}", browser.view);
+        save(&paths[0], [0, 0, 255], 43);
+        let poll_at = Instant::now();
+        browser.next_revision_check = poll_at;
+        browser.schedule_revision_check(poll_at);
+        assert_eq!(browser.next_revision_check, poll_at + REVISION_INTERVAL);
+        wait_for_browser(&mut browser, |browser| {
+            inspection_color(&browser.inspection, browser.inspection_key)
+                == Some(Color::Rgb(0, 0, 255))
+        });
+        assert_eq!(format!("{:?}", browser.view), view_before);
+        assert!(browser.app.is_marked(EntryId(0)));
+        assert_eq!(browser.app.selected_entry().unwrap().id, EntryId(0));
+        browser.handle_inspect_action(Some(Action::CloseInspect));
+        wait_for_browser(&mut browser, |browser| {
+            grid_color(browser) == Some(Color::Rgb(0, 0, 255))
+        });
+
+        browser.start_comparison();
+        wait_for_browser(&mut browser, |browser| {
+            inspection_color(&browser.inspection, browser.inspection_key)
+                == Some(Color::Rgb(0, 0, 255))
+                && inspection_color(&browser.comparison_inspection, browser.comparison_key)
+                    == Some(Color::Rgb(255, 0, 0))
+        });
+        let comparison_before = format!("{:?}", browser.view);
+        save(&paths[0], [0, 255, 0], 44);
+        fs::write(&paths[1], b"partially saved PNG").unwrap();
+        browser.schedule_revision_check(poll_at + REVISION_INTERVAL);
+        wait_for_browser(&mut browser, |browser| {
+            inspection_color(&browser.inspection, browser.inspection_key)
+                == Some(Color::Rgb(0, 255, 0))
+                && matches!(
+                    browser
+                        .comparison_key
+                        .map(|key| browser.comparison_inspection.display(key)),
+                    Some(InspectionDisplay::Error(_))
+                )
+        });
+        save(&paths[1], [255, 255, 0], 45);
+        browser.schedule_revision_check(poll_at + REVISION_INTERVAL * 2);
+        wait_for_browser(&mut browser, |browser| {
+            inspection_color(&browser.comparison_inspection, browser.comparison_key)
+                == Some(Color::Rgb(255, 255, 0))
+        });
+        assert_eq!(format!("{:?}", browser.view), comparison_before);
+        assert!(browser.app.is_marked(EntryId(0)));
+        assert_eq!(browser.app.selected_entry().unwrap().id, EntryId(1));
+        drop(browser);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn image_startup_keeps_focus_when_the_parent_scan_finishes_and_escape_returns_to_grid() {
+        let (old_browser, root) = browser_with_images();
+        drop(old_browser);
+        for name in ["1-one.png", "2-two.png", "3-three.png"] {
+            fs::write(root.join(name), b"decode stays asynchronous").unwrap();
+        }
+        let image = root.join("2-two.png");
+        let target = StartupTarget::resolve(&image).unwrap();
+        assert_eq!(target.root, root.canonicalize().unwrap());
+        let mut browser = Browser::new(
+            target.root,
+            Picker::halfblocks(),
+            "Half 1x2/forced".into(),
+            RuntimeSettings::load(&ConfigSource::Disabled, &CliOverrides::default()).unwrap(),
+            true,
+            None,
+            KittySession::with_tmux(false),
+        );
+        let (path, revision) = target.image.unwrap();
+        browser.open_startup_image(path.clone(), revision);
+        assert!(matches!(browser.view, BrowserView::Inspect(_)));
+        assert_eq!(browser.app.entries.len(), 1);
+        assert_eq!(browser.app.selected_entry().unwrap().path.as_ref(), path);
+
+        // Capture the real scanner's complete batch with a bounded timeout,
+        // then replay it deterministically through the normal background drain.
+        let (sender, receiver) = mpsc::sync_channel(8);
+        loop {
+            let event = browser
+                .scanner
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            let done = matches!(event, ScanEvent::Done);
+            sender.send(event).unwrap();
+            if done {
+                break;
+            }
+        }
+        browser.scanner = receiver;
+        browser.drain_background_work();
+        assert!(browser.app.scan_done);
+        assert_eq!(browser.app.entries.len(), 3);
+        assert_eq!(browser.app.selected_entry().unwrap().path.as_ref(), path);
+        browser.handle_inspect_action(Some(Action::CloseInspect));
+        assert!(matches!(browser.view, BrowserView::Grid));
+        assert_eq!(browser.app.selected_entry().unwrap().path.as_ref(), path);
+        browser.handle_normal_action(Some(Action::MoveRight));
+        assert_ne!(browser.app.selected_entry().unwrap().path.as_ref(), path);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_resolves_directories_and_rejects_missing_or_unsupported_paths() {
+        let (browser, root) = browser_with_images();
+        let target = StartupTarget::resolve(&root).unwrap();
+        assert_eq!(target.root, root.canonicalize().unwrap());
+        assert!(target.image.is_none());
+        assert!(StartupTarget::resolve(&root.join("missing.png")).is_err());
+        let text = root.join("notes.txt");
+        fs::write(&text, "not an image").unwrap();
+        let error = StartupTarget::resolve(&text).err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("not a supported image or directory")
+        );
+        drop(browser);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_canonicalizes_image_symlinks_and_accepts_non_utf8_names() {
+        use std::os::unix::{ffi::OsStringExt, fs::symlink};
+        let (browser, root) = browser_with_images();
+        let image = root.join(std::ffi::OsString::from_vec(b"photo-\xff.PNG".to_vec()));
+        fs::write(&image, b"image").unwrap();
+        let link = root.join("shortcut.png");
+        symlink(&image, &link).unwrap();
+        let target = StartupTarget::resolve(&link).unwrap();
+        assert_eq!(target.image.unwrap().0, image.canonicalize().unwrap());
+        assert_eq!(target.root, root.canonicalize().unwrap());
+        drop(browser);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scan_completion_keeps_discovery_order_until_the_user_sorts() {
+        let (mut browser, root) = browser_with_images();
+        let original = browser.app.filtered.clone();
+        let focused = browser.app.selected_entry().unwrap().id;
+        let (sender, receiver) = mpsc::sync_channel(2);
+        browser.scanner = receiver;
+        sender
+            .send(ScanEvent::Found {
+                path: root.join("0-late.png"),
+                revision: SourceRevision::default(),
+            })
+            .unwrap();
+        sender.send(ScanEvent::Done).unwrap();
+        assert!(browser.drain_background_work());
+        assert!(browser.app.scan_done);
+        assert!(browser.app.filtered.starts_with(&original));
+        let sort_key = Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert!(browser.handle_event(sort_key.clone()));
+        assert_eq!(
+            browser.app.entry(browser.app.filtered[0]).unwrap().label,
+            "0-late.png"
+        );
+        assert_eq!(browser.app.selected_entry().unwrap().id, focused);
+        assert!(browser.handle_event(sort_key));
+        assert!(browser.app.filtered.starts_with(&original));
+        assert_eq!(browser.app.selected_entry().unwrap().id, focused);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -933,7 +1425,7 @@ mod tests {
         let BrowseOutcome::Selection(paths) = confirmed.finish() else {
             panic!("confirmation must produce a selection");
         };
-        assert_eq!(paths, vec![confirmed_root.join("one.png")]);
+        assert_eq!(paths, vec![confirmed_root.join("1-one.png")]);
 
         let (mut cancelled, cancelled_root) = browser_with_images();
         cancelled.selection_mode = true;
@@ -1026,6 +1518,205 @@ mod tests {
         assert!(matches!(browser.view, BrowserView::Grid));
         assert_eq!(browser.app.selected_entry().unwrap().id, EntryId(1));
         assert_eq!(browser.app.marked_count(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn closing_the_browser_deletes_only_transmitted_kitty_images() {
+        use image::DynamicImage;
+        use ratatui::{Terminal, backend::TestBackend, layout::Size};
+
+        use crate::{
+            kitty::{KittyImage, KittyProtocol},
+            thumbnails::{PreparedThumbnail, ThumbnailKey},
+        };
+
+        let (mut browser, root) = browser_with_images();
+        let session = browser.kitty_session.clone();
+        let key = |entry_id| ThumbnailKey {
+            entry_id: EntryId(entry_id),
+            revision: SourceRevision::default(),
+            size: Size::new(1, 1),
+            quality: "7".parse().unwrap(),
+        };
+        let transmitted = KittyProtocol::new(
+            DynamicImage::new_rgba8(1, 1),
+            Size::new(1, 1),
+            session.clone(),
+        )
+        .unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(1, 1)).unwrap();
+        terminal
+            .draw(|frame| frame.render_widget(KittyImage::new(&transmitted), frame.area()))
+            .unwrap();
+        let transmitted_id = transmitted.id();
+        browser
+            .thumbnails
+            .insert(key(0), PreparedThumbnail::Kitty(transmitted));
+        let never_sent = KittyProtocol::new(
+            DynamicImage::new_rgba8(1, 1),
+            Size::new(1, 1),
+            session.clone(),
+        )
+        .unwrap();
+        let never_sent_id = never_sent.id();
+        browser
+            .thumbnails
+            .insert(key(1), PreparedThumbnail::Kitty(never_sent));
+
+        let mut output = Vec::new();
+        assert!(matches!(
+            close(browser, &session, &mut output).unwrap(),
+            BrowseOutcome::Completed
+        ));
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.matches("a=d,d=I,i=").count(), 1);
+        assert!(output.contains(&format!("a=d,d=I,i={transmitted_id}")));
+        assert!(!output.contains(&format!("i={never_sent_id}")));
+        assert!(!session.has_pending_cleanup());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn frames_that_transmit_kitty_images_schedule_delayed_repaint_nudges() {
+        use std::sync::{Arc, Mutex};
+
+        use image::DynamicImage;
+        use ratatui::{
+            Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, layout::Rect,
+        };
+
+        use crate::{kitty::KittyProtocol, thumbnails::PreparedThumbnail, ui::GridLayout};
+
+        #[derive(Clone)]
+        struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for SharedWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (mut browser, root) = browser_with_images();
+        browser.app.scan_done = true;
+        assert!(!browser.has_background_work());
+        let output = SharedWriter(Arc::new(Mutex::new(Vec::new())));
+        let backend = CrosstermBackend::new(Box::new(output.clone()) as Box<dyn io::Write + Send>);
+        let area = Rect::new(0, 0, 40, 20);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fixed(area),
+            },
+        )
+        .unwrap();
+        let transmitted = |output: &SharedWriter| {
+            String::from_utf8_lossy(&output.0.lock().unwrap()).contains("a=T,U=1")
+        };
+        let start = Instant::now();
+
+        browser.render_frame_at(&mut terminal, start).unwrap();
+        assert!(!transmitted(&output));
+        assert!(
+            browser.repaint_nudges.is_empty(),
+            "no transmission, no nudge"
+        );
+        assert_eq!(
+            browser.poll_wait(start),
+            poll_interval(browser.has_background_work())
+        );
+
+        let image_size = GridLayout::new_for_test(area, DEFAULT_THUMBNAIL_SIZE).image_size;
+        let entry = browser.app.selected_entry().unwrap();
+        let key = ThumbnailKey {
+            entry_id: entry.id,
+            revision: entry.revision,
+            size: image_size,
+            quality: browser.thumbnail_quality,
+        };
+        let protocol = KittyProtocol::new(
+            DynamicImage::new_rgba8(2, 2),
+            image_size,
+            browser.kitty_session.clone(),
+        )
+        .unwrap();
+        browser
+            .thumbnails
+            .insert(key, PreparedThumbnail::Kitty(protocol));
+        output.0.lock().unwrap().clear();
+        browser.render_frame_at(&mut terminal, start).unwrap();
+        assert!(
+            transmitted(&output),
+            "the frame must transmit the inserted image"
+        );
+        assert_eq!(
+            browser.repaint_nudges,
+            REPAINT_NUDGE_DELAYS.map(|delay| start + delay).to_vec()
+        );
+        assert_eq!(browser.poll_wait(start), REPAINT_NUDGE_DELAYS[0]);
+
+        let mut nudges = Vec::new();
+        assert_eq!(
+            browser
+                .write_due_repaint_nudges(&mut nudges, start + Duration::from_millis(10))
+                .unwrap(),
+            0
+        );
+        assert!(
+            nudges.is_empty(),
+            "nothing is written before the first delay"
+        );
+        assert_eq!(
+            browser
+                .write_due_repaint_nudges(&mut nudges, start + REPAINT_NUDGE_DELAYS[0])
+                .unwrap(),
+            1
+        );
+        assert_eq!(nudges, b"\x1b[?25l");
+        assert_eq!(browser.repaint_nudges.len(), 1);
+        assert_eq!(
+            browser.poll_wait(start + REPAINT_NUDGE_DELAYS[0]),
+            REPAINT_NUDGE_DELAYS[1] - REPAINT_NUDGE_DELAYS[0]
+        );
+        assert_eq!(
+            browser
+                .write_due_repaint_nudges(&mut nudges, start + Duration::from_secs(5))
+                .unwrap(),
+            1
+        );
+        assert!(browser.repaint_nudges.is_empty());
+
+        output.0.lock().unwrap().clear();
+        browser.render_frame_at(&mut terminal, start).unwrap();
+        assert!(
+            !transmitted(&output),
+            "placeholder-only frames do not retransmit"
+        );
+        assert!(browser.repaint_nudges.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn idle_loop_polls_slowly_only_without_background_work() {
+        assert_eq!(poll_interval(true), FRAME_INTERVAL);
+        assert_eq!(poll_interval(false), IDLE_INTERVAL);
+        assert!(IDLE_INTERVAL > FRAME_INTERVAL);
+
+        let (mut browser, root) = browser_with_images();
+        assert!(browser.has_background_work(), "the scan is still running");
+        browser.app.scan_done = true;
+        assert!(!browser.has_background_work());
+
+        browser.view = BrowserView::Inspect(ViewState::default());
+        browser.inspection_size = ratatui::layout::Size::new(8, 4);
+        assert!(browser.schedule_inspection(ViewState::default()));
+        assert!(
+            browser.has_background_work(),
+            "an inspection request is pending"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
